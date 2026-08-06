@@ -4,6 +4,7 @@ from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from fpdf import FPDF
 from datetime import datetime
+from pypdf import PdfReader
 
 app = Flask(__name__)
 CORS(app)
@@ -14,6 +15,25 @@ def buscar_dados_cnpj(cnpj_limpo):
     if response.status_code == 200:
         return response.json()
     return None
+
+def extrair_pendencias_do_pdf(pdf_file):
+    """Lê o PDF da Receita e extrai as pendências automaticamente"""
+    try:
+        reader = PdfReader(pdf_file)
+        texto_completo = ""
+        for page in reader.pages:
+            texto_completo += page.extract_text() + "\n"
+        
+        # Procura a parte das pendências no texto do ADE
+        marcador = "discriminadas abaixo:"
+        if marcador in texto_completo:
+            partes = texto_completo.split(marcador)
+            # Corta antes do Parágrafo único para pegar só as pendências
+            pendencias_sujas = partes[1].split("Parágrafo único")[0]
+            return pendencias_sujas.strip()
+        return "Nenhuma declaração específica listada no documento."
+    except Exception as e:
+        return f"Erro ao ler PDF: {str(e)}"
 
 class PDFRelatorio(FPDF):
     def header(self):
@@ -28,7 +48,6 @@ class PDFRelatorio(FPDF):
         self.ln(5)
 
 def gerar_pdf_isca(dados_empresa):
-    """Gera o PDF Preliminar para o cliente no site público"""
     pdf = PDFRelatorio()
     pdf.add_page()
     
@@ -49,8 +68,7 @@ def gerar_pdf_isca(dados_empresa):
     
     return io.BytesIO(pdf.output(dest='S').encode('latin1'))
 
-def gerar_pdf_completo(dados_empresa, manual_data):
-    """Gera o PDF Completo (Backoffice) com as 3 consultas juntas"""
+def gerar_pdf_completo(dados_empresa, manual_data, texto_pendencias):
     pdf = PDFRelatorio()
     pdf.add_page()
     
@@ -66,14 +84,12 @@ def gerar_pdf_completo(dados_empresa, manual_data):
     pdf.cell(0, 6, f"Data da Análise: {datetime.now().strftime('%d/%m/%Y')}", ln=True)
     pdf.ln(5)
 
-    # SEÇÃO 1
     pdf.set_font("Arial", 'B', 12)
     pdf.set_text_color(15, 44, 89)
     pdf.cell(0, 8, "1. SITUAÇÃO ATUAL DA EMPRESA", ln=True)
     pdf.set_font("Arial", '', 10)
     pdf.set_text_color(0, 0, 0)
     
-    # Tabela Simples
     pdf.set_font("Arial", 'B', 10)
     pdf.cell(50, 6, "Situação Cadastral:", border=1)
     pdf.set_font("Arial", '', 10)
@@ -82,7 +98,7 @@ def gerar_pdf_completo(dados_empresa, manual_data):
     pdf.set_font("Arial", 'B', 10)
     pdf.cell(50, 6, "Pendências (Omissões):", border=1)
     pdf.set_font("Arial", '', 10)
-    pdf.multi_cell(0, 6, manual_data.get('pendencias', 'Nenhuma identificada'), border=1)
+    pdf.multi_cell(0, 6, texto_pendencias, border=1)
     
     pdf.set_font("Arial", 'B', 10)
     pdf.cell(50, 6, "Regime Tributário:", border=1)
@@ -101,7 +117,6 @@ def gerar_pdf_completo(dados_empresa, manual_data):
     pdf.multi_cell(0, 5, "ATENÇÃO / RISCOS IMEDIATOS: A condição de Inaptidão paralisa as operações legais da empresa e gera impactos imediatos:\n- Inidoneidade de Documentos: Impedimento total de emitir notas fiscais válidas.\n- Bloqueio Bancário: Restrições na conta e travamento financeiro.\n- Responsabilização do CPF: As pendências e débitos são transferidos para o CPF dos sócios.", fill=True)
     pdf.ln(5)
 
-    # SEÇÃO 2
     pdf.set_font("Arial", 'B', 12)
     pdf.set_text_color(15, 44, 89)
     pdf.cell(0, 8, "2. OPÇÕES PARA DECISÃO DO CLIENTE", ln=True)
@@ -117,7 +132,6 @@ def gerar_pdf_completo(dados_empresa, manual_data):
     pdf.multi_cell(0, 5, "Passo 1: Entrega das declarações omitidas (requisito obrigatório para baixa).\nPasso 2: Pedido de encerramento do CNPJ.")
     pdf.ln(5)
 
-    # SEÇÃO 3
     pdf.set_font("Arial", 'B', 12)
     pdf.set_text_color(15, 44, 89)
     pdf.cell(0, 8, "3. PRÓXIMOS PASSOS", ln=True)
@@ -127,7 +141,6 @@ def gerar_pdf_completo(dados_empresa, manual_data):
 
     return io.BytesIO(pdf.output(dest='S').encode('latin1'))
 
-# ROTA 1: Site Público (Isca)
 @app.route('/gerar-pdf', methods=['POST'])
 def rota_isca():
     cnpj_limpo = ''.join(filter(str.isdigit, request.json.get('cnpj', '')))
@@ -135,13 +148,25 @@ def rota_isca():
     pdf_file = gerar_pdf_isca(dados)
     return send_file(pdf_file, mimetype='application/pdf', as_attachment=True, download_name=f'Preliminar_{cnpj_limpo}.pdf')
 
-# ROTA 2: Backoffice (Relatório Completo)
 @app.route('/gerar-pdf-completo', methods=['POST'])
 def rota_completa():
-    dados_manuais = request.json
-    cnpj_limpo = ''.join(filter(str.isdigit, dados_manuais.get('cnpj', '')))
+    # Agora recebemos arquivos e dados de formulário
+    cnpj_recebido = request.form.get('cnpj', '')
+    status = request.form.get('status', 'INAPTA')
+    regime = request.form.get('regime', 'N/A')
+    
+    cnpj_limpo = ''.join(filter(str.isdigit, cnpj_recebido))
+    
+    texto_pendencias = "Nenhuma pendência informada / Documento não enviado."
+    if 'pdf_receita' in request.files:
+        arquivo_pdf = request.files['pdf_receita']
+        if arquivo_pdf.filename != '':
+            texto_pendencias = extrair_pendencias_do_pdf(arquivo_pdf)
+
     dados_api = buscar_dados_cnpj(cnpj_limpo)
-    pdf_file = gerar_pdf_completo(dados_api, dados_manuais)
+    manual_data = {'cnpj': cnpj_recebido, 'status': status, 'regime': regime}
+    
+    pdf_file = gerar_pdf_completo(dados_api, manual_data, texto_pendencias)
     return send_file(pdf_file, mimetype='application/pdf', as_attachment=True, download_name=f'Completo_{cnpj_limpo}.pdf')
 
 if __name__ == '__main__':
